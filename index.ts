@@ -3,6 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/*
+ * DISCLAIMER: This is a forked version of the official Elasticsearch MCP server
+ * used for prototyping additional tools and capabilities. It should not be confused
+ * with the official Elasticsearch MCP server maintained by Elastic.
+ * 
+ * This prototype extends the original server with additional high-level tools for
+ * index management, document indexing, and user preference storage.
+ */
+
 import '@elastic/opentelemetry-node'
 import './telemetry.js'
 

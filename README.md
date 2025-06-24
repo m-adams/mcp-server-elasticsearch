@@ -1,14 +1,27 @@
-# Elasticsearch MCP Server
+# Elasticsearch MCP Server (Prototype Extension)
+
+> **DISCLAIMER**: This is a forked prototype version of the official Elasticsearch MCP server, extended with additional high-level tools and capabilities. It is not the official server maintained by Elastic and is intended for prototyping and experimentation purposes only.
 
 This repository contains experimental features intended for research and evaluation and are not production-ready.
 
 Connect to your Elasticsearch data directly from any MCP Client (like Claude Desktop) using the Model Context Protocol (MCP).
 
-This server connects agents to your Elasticsearch data using the Model Context Protocol. It allows you to interact with your Elasticsearch indices through natural language conversations.
+This server connects agents to your Elasticsearch data using the Model Context Protocol. It allows you to interact with your Elasticsearch indices through natural language conversations. This prototype extension adds high-level tools for index management, document operations, templates, and user preference storage/retrieval.
 
 <a href="https://glama.ai/mcp/servers/@elastic/mcp-server-elasticsearch">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/@elastic/mcp-server-elasticsearch/badge" alt="Elasticsearch Server MCP server" />
 </a>
+
+## About This Prototype Extension
+
+This is a prototype extension of the official Elasticsearch MCP server, created for research and experimentation purposes. It adds several high-level tools focused on making it easier to:
+
+1. **Manage Elasticsearch indices** - Create, delete, and list indices with safety checks
+2. **Work with documents** - Single and bulk document operations with simplified APIs
+3. **Manage templates** - Create and use index templates for consistent mapping
+4. **Store user preferences** - Remember and recall user preferences with rich metadata support
+
+These extensions are designed for easier prototyping and are not officially supported by Elastic. The original server functionality remains intact.
 
 ## Available Tools
 
