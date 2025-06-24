@@ -12,10 +12,28 @@ This server connects agents to your Elasticsearch data using the Model Context P
 
 ## Available Tools
 
+### Read Tools
 * `list_indices`: List all available Elasticsearch indices
 * `get_mappings`: Get field mappings for a specific Elasticsearch index
 * `search`: Perform an Elasticsearch search with the provided query DSL
 * `get_shards`: Get shard information for all or specific indices
+
+### Write Tools
+* `create_index`: Create a new Elasticsearch index with specified mappings
+* `index_document`: Index a document into an Elasticsearch index
+* `bulk_index_documents`: Index multiple documents into an Elasticsearch index
+* `delete_index`: Delete an Elasticsearch index (with safety confirmation)
+
+### Template Tools
+* `list_templates`: List all available Elasticsearch index templates
+* `create_template`: Create an Elasticsearch index template
+* `create_index_from_template`: Create a new index using an existing template
+
+### User Preference Tools
+* `remember_user_preference`: Store a user preference with metadata for future retrieval
+* `recall_user_preferences`: Retrieve stored preferences for a user, optionally filtered by category
+
+> **Note:** All indices and templates created through this MCP server are automatically prefixed with `mcp-` for safety.
 
 ## Prerequisites
 
@@ -111,6 +129,7 @@ The Elasticsearch MCP Server supports configuration options to connect to your E
 | `ES_SSL_SKIP_VERIFY` | Set to '1' or 'true' to skip SSL certificate verification             | No       |
 | `ES_PATH_PREFIX`     | Path prefix for Elasticsearch instance exposed at a non-root path     | No       |
 | `ES_VERSION`         | Server assumes Elasticsearch 9.x. Set to `8` target Elasticsearch 8.x | No       |
+| `ES_INDEX_PREFIX`    | Prefix for indices created through the MCP server (default: `mcp-`)   | No       |
 
 ### Developing Locally
 
@@ -181,10 +200,23 @@ We welcome contributions from the community! For details on how to contribute, p
 > [!TIP]
 > Here are some natural language queries you can try with your MCP Client.
 
+### Read Operations
 * "What indices do I have in my Elasticsearch cluster?"
 * "Show me the field mappings for the 'products' index."
 * "Find all orders over $500 from last month."
 * "Which products received the most 5-star reviews?"
+
+### Write Operations
+* "Create a new index called 'customer-feedback' with text fields for comments and keyword fields for product IDs."
+* "Add this customer review to the feedback index: {review text and rating}."
+* "Create a template for logs that includes timestamp and severity fields."
+* "Create a new customer-logs index based on the logs template."
+
+### User Preference Operations
+* "Remember that this user prefers technical explanations with code examples."
+* "Store the user's preference for concise communication with confidence 0.9."
+* "What preferences do we have for user123?"
+* "What communication style does this user prefer?" 
 
 ## How It Works
 
