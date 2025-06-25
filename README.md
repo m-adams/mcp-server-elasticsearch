@@ -20,6 +20,8 @@ This is a prototype extension of the official Elasticsearch MCP server, created 
 2. **Work with documents** - Single and bulk document operations with simplified APIs
 3. **Manage templates** - Create and use index templates for consistent mapping
 4. **Store user preferences** - Remember and recall user preferences with rich metadata support
+5. **Conversation storage** - Store and retrieve conversation summaries with semantic search capabilities
+6. **Development tools** - Generic API access for testing and debugging (development only)
 
 These extensions are designed for easier prototyping and are not officially supported by Elastic. The original server functionality remains intact.
 
@@ -45,6 +47,19 @@ These extensions are designed for easier prototyping and are not officially supp
 ### User Preference Tools
 * `remember_user_preference`: Store a user preference with metadata for future retrieval
 * `recall_user_preferences`: Retrieve stored preferences for a user, optionally filtered by category
+
+### Conversation Storage Tools
+* `store_conversation_summary`: Store or update a conversation summary with semantic search capabilities
+* `update_conversation_summary`: Update specific fields of an existing conversation summary
+* `delete_conversation_data`: Delete conversation summary and/or messages with confirmation
+* `get_conversation_statistics`: Get analytics about stored conversations
+* `store_conversation`: Store a complete conversation (legacy support)
+* `recall_conversation`: Retrieve stored conversations for a user
+
+### Development Tools
+* `elasticsearch_api_call`: ⚠️ **TESTING/DEVELOPMENT ONLY** - Direct Elasticsearch API access
+
+> **⚠️ WARNING:** The `elasticsearch_api_call` tool is for testing and development purposes only. It bypasses MCP safety features and should never be used in production environments. Use the specific MCP tools instead.
 
 > **Note:** All indices and templates created through this MCP server are automatically prefixed with `mcp-` for safety.
 
@@ -132,6 +147,14 @@ The Elasticsearch MCP Server supports configuration options to connect to your E
 > [!NOTE]
 > You must provide either an API key or both username and password for authentication.
 
+#### Semantic Text Features
+
+This server includes enhanced semantic search capabilities using Elasticsearch's `semantic_text` field type. When enabled, conversation summaries and other text content will be automatically processed for semantic search using machine learning models.
+
+- **Automatic setup**: If an inference endpoint is available, semantic text fields are created automatically
+- **Graceful fallback**: If semantic text is unavailable, regular text fields are used instead
+- **Configurable**: Control semantic text behavior through environment variables
+
 | Environment Variable | Description                                                           | Required |
 |----------------------|-----------------------------------------------------------------------|----------|
 | `ES_URL`             | Your Elasticsearch instance URL                                       | Yes      |
@@ -143,6 +166,9 @@ The Elasticsearch MCP Server supports configuration options to connect to your E
 | `ES_PATH_PREFIX`     | Path prefix for Elasticsearch instance exposed at a non-root path     | No       |
 | `ES_VERSION`         | Server assumes Elasticsearch 9.x. Set to `8` target Elasticsearch 8.x | No       |
 | `ES_INDEX_PREFIX`    | Prefix for indices created through the MCP server (default: `mcp-`)   | No       |
+| `ES_ENABLE_SEMANTIC_TEXT` | Enable semantic text fields for enhanced search (default: `true`) | No       |
+| `ES_INFERENCE_ENDPOINT` | Elasticsearch inference endpoint for semantic text processing (default: `.multilingual-e5-small-elasticsearch`) | No       |
+| `ES_SEMANTIC_FALLBACK` | Fallback to regular text fields if semantic text unavailable (default: `true`) | No       |
 
 ### Developing Locally
 
@@ -182,7 +208,8 @@ The Elasticsearch MCP Server supports configuration options to connect to your E
          ],
          "env": {
            "ES_URL": "your-elasticsearch-url",
-           "ES_API_KEY": "your-api-key"
+           "ES_API_KEY": "your-api-key",
+           "OTEL_LOG_LEVEL": "none"
          }
        }
      }
@@ -203,6 +230,14 @@ The Elasticsearch MCP Server supports configuration options to connect to your E
 
    🔍 MCP Inspector is up and running at http://localhost:5173 🚀
    ```
+
+6. **Testing Semantic Text Configuration**
+
+   ```bash
+   ES_URL=your-elasticsearch-url ES_API_KEY=your-api-key node test-semantic-config.js
+   ```
+
+   This utility tests semantic text configuration and shows whether inference endpoints are available.
 
 ## Contributing
 
@@ -231,11 +266,38 @@ We welcome contributions from the community! For details on how to contribute, p
 * "What preferences do we have for user123?"
 * "What communication style does this user prefer?" 
 
+### Conversation Storage Operations
+* "Store this conversation summary: 'User asked about API integration best practices. Provided detailed guidance on authentication and error handling.'"
+* "Update the conversation summary to include the outcome: 'Successfully implemented OAuth flow'"
+* "Show me conversation statistics for the last 30 days"
+* "What are the trending topics in stored conversations?"
+
+### Development/Testing Operations
+> **⚠️ WARNING:** These examples are for testing/development only. DO NOT use in production.
+
+* "Check cluster health using the generic API tool" (sets acknowledge_testing_only=true)
+* "Get node info using direct API access for debugging"
+* "Test a custom aggregation query using the generic tool"
+
 ## How It Works
 
 1. The MCP Client analyzes your request and determines which Elasticsearch operations are needed.
 2. The MCP server carries out these operations (listing indices, fetching mappings, performing searches).
 3. The MCP Client processes the results and presents them in a user-friendly format.
+
+### Architecture
+
+The server is built with a modular architecture:
+
+- **`index.ts`**: Main server implementation with all MCP tools
+- **`mappings.ts`**: Centralized index mapping configurations with semantic text support
+- **`telemetry.ts`**: OpenTelemetry instrumentation for observability
+- **`test-semantic-config.js`**: Utility for testing semantic text configuration
+
+**Key Features:**
+- **Configurable semantic text**: Automatic fallback to regular text fields when inference endpoints are unavailable
+- **Safety-first design**: All indices are prefixed, destructive operations require confirmation
+- **Maintainable mappings**: Index configurations are centralized and type-safe
 
 ## Security Best Practices
 
@@ -277,10 +339,27 @@ This project is licensed under the Apache License 2.0.
 
 ## Troubleshooting
 
+### General Issues
 * Ensure your MCP configuration is correct.
 * Verify that your Elasticsearch URL is accessible from your machine.
 * Check that your authentication credentials (API key or username/password) have the necessary permissions.
 * If using SSL/TLS with a custom CA, verify that the certificate path is correct and the file is readable.
 * Look at the terminal output for error messages.
+
+### Semantic Text Issues
+* **Inference endpoint not found**: If you see warnings about inference endpoints, either:
+  - Install the required inference model in Elasticsearch
+  - Set `ES_ENABLE_SEMANTIC_TEXT=false` to disable semantic text features
+  - Ensure `ES_SEMANTIC_FALLBACK=true` (default) to use regular text fields
+* **Script compilation errors**: These have been resolved by removing Painless script dependencies in conversation updates
+
+### Development Tool Issues
+* **HTTP method errors**: Ensure you're using uppercase methods (GET, POST, etc.) with the `elasticsearch_api_call` tool
+* **Authentication errors**: The generic API tool uses the same authentication as other tools
+
+### Performance Considerations
+* Semantic text processing requires additional compute resources
+* Large conversation storage operations may take longer with semantic text enabled
+* Consider adjusting index refresh intervals for high-volume usage
 
 If you encounter issues, feel free to open an issue on the GitHub repository.

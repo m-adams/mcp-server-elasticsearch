@@ -9,7 +9,8 @@
  * with the official Elasticsearch MCP server maintained by Elastic.
  * 
  * This prototype extends the original server with additional high-level tools for
- * index management, document indexing, and user preference storage.
+ * index management, document indexing, user preference storage, and conversation 
+ * storage and retrieval.
  */
 
 import '@elastic/opentelemetry-node'
@@ -27,8 +28,15 @@ import {
 } from '@elastic/elasticsearch'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import fs from 'fs'
+import { randomUUID } from 'crypto'
 // @ts-expect-error ignore `with` keyword
 import pkg from './package.json' with { type: 'json' }
+import { 
+  createSemanticTextConfig, 
+  getIndexConfigurations, 
+  DEFAULT_SEMANTIC_CONFIG,
+  type SemanticTextConfig 
+} from './mappings.js'
 
 // Product metadata, used to generate the request User-Agent header and
 // passed to the McpServer constructor.
@@ -106,6 +114,21 @@ const ConfigSchema = z
       .default('mcp-')
       .describe('Prefix to add to all indices created via MCP'),
 
+    enableSemanticText: z
+      .boolean()
+      .default(true)
+      .describe('Enable semantic text fields for enhanced search capabilities'),
+
+    inferenceEndpoint: z
+      .string()
+      .default(DEFAULT_SEMANTIC_CONFIG.inferenceEndpoint)
+      .describe('Elasticsearch inference endpoint for semantic text processing'),
+
+    semanticFallback: z
+      .boolean()
+      .default(true)
+      .describe('Fallback to regular text fields if semantic text is unavailable'),
+
   })
   .refine(
     (data) => {
@@ -131,7 +154,7 @@ type ElasticsearchConfig = z.infer<typeof ConfigSchema>
 
 export async function createElasticsearchMcpServer (config: ElasticsearchConfig): Promise<McpServer> {
   const validatedConfig = ConfigSchema.parse(config)
-  const { url, apiKey, username, password, caCert, version, pathPrefix, sslSkipVerify, indexPrefix } = validatedConfig
+  const { url, apiKey, username, password, caCert, version, pathPrefix, sslSkipVerify, indexPrefix, enableSemanticText, inferenceEndpoint, semanticFallback } = validatedConfig
 
   const clientOptions: ClientOptions = {
     node: url,
@@ -187,6 +210,17 @@ export async function createElasticsearchMcpServer (config: ElasticsearchConfig)
   }
 
   const esClient = new Client(clientOptions)
+
+  // Initialize semantic text configuration
+  const semanticConfig = await createSemanticTextConfig(
+    esClient,
+    enableSemanticText,
+    inferenceEndpoint,
+    semanticFallback
+  )
+
+  // Get index configurations with semantic text settings
+  const indexConfigurations = getIndexConfigurations(semanticConfig)
 
   const server = new McpServer(product)
 
@@ -1158,24 +1192,11 @@ Always use the full name '${prefixedName}' when referring to this index in futur
         
         if (!indexExists) {
           // Create index with appropriate mappings for user preferences
+          const preferencesConfig = indexConfigurations['user-preferences']
           await esClient.indices.create({
             index: preferencesIndexName,
-            mappings: {
-              properties: {
-                user_id: { type: 'keyword' },
-                category: { type: 'keyword' },
-                preference: { 
-                  type: 'object',
-                  enabled: true
-                },
-                preference_text: { type: 'text' },
-                confidence_level: { type: 'float' },
-                source: { type: 'keyword' },
-                created_at: { type: 'date' },
-                updated_at: { type: 'date' },
-                expires_at: { type: 'date' }
-              }
-            }
+            settings: preferencesConfig.settings,
+            mappings: preferencesConfig.mappings
           })
         }
         
@@ -1414,6 +1435,1290 @@ Always use the full name '${prefixedName}' when referring to this index in futur
     }
   )
 
+  // Tool 14: Store Conversation
+  server.tool(
+    'store_conversation',
+    'Store a conversation in Elasticsearch for later retrieval',
+    {
+      user_id: z
+        .string()
+        .trim()
+        .min(1, 'User ID is required')
+        .describe('Unique identifier for the user'),
+        
+      conversation: z
+        .array(
+          z.object({
+            role: z.enum(['user', 'assistant']),
+            content: z.string().min(1, 'Message content cannot be empty')
+          })
+        )
+        .min(1, 'At least one message is required')
+        .describe('The conversation messages to be stored'),
+        
+      metadata: z
+        .record(z.any())
+        .optional()
+        .describe('Optional metadata to store with the conversation'),
+        
+      expires_after_days: z
+        .number()
+        .int('Expiration days must be an integer')
+        .min(0, 'Expiration days must be non-negative')
+        .optional()
+        .describe('Auto-expire this conversation after N days')
+    },
+    async ({ user_id, conversation, metadata, expires_after_days }) => {
+      try {
+        // First check if conversations index exists, create if not
+        const conversationsIndexName = `${indexPrefix}conversations`
+        
+        const indexExists = await esClient.indices.exists({ 
+          index: conversationsIndexName 
+        })
+        
+        if (!indexExists) {
+          // Create index with appropriate mappings for conversations
+          const conversationsConfig = indexConfigurations['conversations']
+          await esClient.indices.create({
+            index: conversationsIndexName,
+            settings: conversationsConfig.settings,
+            mappings: conversationsConfig.mappings
+          })
+        }
+        
+        const now = new Date()
+        let expiresAt = null
+        
+        if (expires_after_days !== undefined) {
+          expiresAt = new Date(now)
+          expiresAt.setDate(expiresAt.getDate() + expires_after_days)
+        }
+        
+        // Prepare document with proper metadata
+        const conversationDoc = {
+          user_id,
+          conversation,
+          metadata: metadata || {},
+          created_at: now.toISOString(),
+          updated_at: now.toISOString(),
+          expires_at: expiresAt ? expiresAt.toISOString() : null
+        }
+        
+        // Index the conversation document
+        const response = await esClient.index({
+          index: conversationsIndexName,
+          body: conversationDoc,
+          refresh: true
+        })
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Successfully stored conversation for user '${user_id}' with ID: ${response._id}.`
+          }]
+        }
+      } catch (error) {
+        console.error(`Failed to store conversation: ${error instanceof Error ? error.message : String(error)}`)
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Error: ${error instanceof Error ? error.message : String(error)}`
+          }]
+        }
+      }
+    }
+  )
+
+  // Tool 15: Recall Conversation
+  server.tool(
+    'recall_conversation',
+    'Retrieve a stored conversation for a user',
+    {
+      user_id: z
+        .string()
+        .trim()
+        .min(1, 'User ID is required')
+        .describe('Unique identifier for the user'),
+        
+      limit: z
+        .number()
+        .int('Limit must be an integer')
+        .min(1, 'Limit must be at least 1')
+        .max(100, 'Limit must not exceed 100')
+        .default(1)
+        .describe('Maximum number of conversations to retrieve'),
+        
+      include_expired: z
+        .boolean()
+        .default(false)
+        .describe('Whether to include expired conversations')
+    },
+    async ({ user_id, limit, include_expired }) => {
+      try {
+        const conversationsIndexName = `${indexPrefix}conversations`
+        
+        // Check if conversations index exists
+        const indexExists = await esClient.indices.exists({ 
+          index: conversationsIndexName 
+        })
+        
+        if (!indexExists) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `No conversations found. Conversations index does not exist.`
+            }]
+          }
+        }
+        
+        // Build the query based on parameters
+        const must: any[] = [
+          { term: { user_id } }
+        ]
+        
+        // Add filter for non-expired conversations if needed
+        if (!include_expired) {
+          must.push({
+            bool: {
+              should: [
+                { bool: { must_not: { exists: { field: 'expires_at' } } } },
+                { range: { expires_at: { gt: 'now' } } }
+              ]
+            }
+          })
+        }
+        
+        // Execute search
+        const searchResponse = await esClient.search({
+          index: conversationsIndexName,
+          query: {
+            bool: {
+              must
+            }
+          },
+          size: limit,
+          sort: [
+            { 'updated_at': { order: 'desc' } }
+          ]
+        })
+        
+        // Format results
+        const conversations = searchResponse.hits.hits.map(hit => {
+          const source = hit._source as any
+          const isExpired = source.expires_at && new Date(source.expires_at) < new Date()
+          
+          return {
+            user_id: source.user_id,
+            conversation: source.conversation,
+            metadata: source.metadata,
+            created_at: source.created_at,
+            updated_at: source.updated_at,
+            expires_at: source.expires_at,
+            is_expired: isExpired
+          }
+        })
+        
+        if (conversations.length === 0) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `No conversations found for user '${user_id}'.`
+            }]
+          }
+        }
+        
+        const summaryText = `Found ${conversations.length} conversation(s) for user '${user_id}':`
+        
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: summaryText
+            },
+            {
+              type: 'text' as const,
+              text: JSON.stringify(conversations, null, 2)
+            }
+          ]
+        }
+      } catch (error) {
+        console.error(`Failed to retrieve conversation: ${error instanceof Error ? error.message : String(error)}`)
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Error: ${error instanceof Error ? error.message : String(error)}`
+          }]
+        }
+      }
+    }
+  )
+
+  // Tool: Store Conversation Summary
+  server.tool(
+    'store_conversation_summary',
+    'Store or update a conversation summary with semantic search capabilities',
+    {
+      conversation_id: z
+        .string()
+        .trim()
+        .optional()
+        .describe('UUID for the conversation (auto-generated if not provided)'),
+        
+      user_id: z
+        .string()
+        .trim()
+        .min(1, 'User ID is required')
+        .describe('User identifier'),
+        
+      title: z
+        .string()
+        .trim()
+        .min(1, 'Title is required')
+        .describe('Brief conversation title'),
+        
+      summary: z
+        .string()
+        .trim()
+        .min(1, 'Summary is required')
+        .describe('Detailed summary optimized for search'),
+        
+      key_topics: z
+        .array(z.string())
+        .optional()
+        .describe('Array of topic keywords'),
+        
+      outcome: z
+        .string()
+        .optional()
+        .describe('What was accomplished/resolved'),
+        
+      message_count: z
+        .number()
+        .int()
+        .optional()
+        .describe('Total messages in conversation'),
+        
+      metadata: z
+        .record(z.any())
+        .optional()
+        .describe('Additional context (tags, categories, etc.)'),
+        
+      update_mode: z
+        .enum(['create', 'update', 'append'])
+        .default('create')
+        .describe('Create new, update fields, or append to summary')
+    },
+    async ({ 
+      conversation_id, 
+      user_id, 
+      title, 
+      summary, 
+      key_topics, 
+      outcome, 
+      message_count, 
+      metadata, 
+      update_mode 
+    }) => {
+      try {
+        const summariesIndex = `${indexPrefix}conversation-summaries`
+        
+        // Ensure indices exist
+        await ensureConversationIndicesExist()
+        
+        // Generate UUID if not provided
+        const conversationId = conversation_id || randomUUID()
+        
+        // Get current timestamp
+        const now = new Date().toISOString()
+        
+        // Check if conversation already exists (for update/append mode)
+        const exists = await conversationExists(conversationId)
+        
+        if (update_mode !== 'create' && !exists) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(formatErrorResponse(
+                `Conversation with ID ${conversationId} not found`, 
+                'CONVERSATION_NOT_FOUND'
+              ), null, 2)
+            }]
+          }
+        }
+        
+        let summaryDoc: any = {
+          conversation_id: conversationId,
+          user_id,
+          title,
+          summary,
+          semantic_summary: summary, // This field will be processed by the semantic_text mapping
+          updated_at: now
+        }
+        
+        // Add optional fields if provided
+        if (key_topics) summaryDoc.key_topics = key_topics
+        if (outcome) summaryDoc.outcome = outcome
+        if (message_count !== undefined) summaryDoc.message_count = message_count
+        if (metadata) summaryDoc.metadata = metadata
+        
+        // For create mode or if record doesn't exist yet
+        if (update_mode === 'create' || !exists) {
+          summaryDoc.created_at = now
+          
+          await esClient.index({
+            index: summariesIndex,
+            id: conversationId,
+            body: summaryDoc,
+            refresh: true
+          })
+          
+          const response = formatSuccessResponse(
+            { conversation_id: conversationId, created: true },
+            'store_conversation_summary'
+          )
+          
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(response, null, 2)
+            }]
+          }
+        } 
+        // Update or append to existing
+        else {
+          // Get existing document for append mode or to preserve created_at
+          const existingDoc = await esClient.get({
+            index: summariesIndex,
+            id: conversationId
+          })
+          
+          const existingSource = existingDoc._source as any
+          
+          // Preserve original creation date
+          summaryDoc.created_at = existingSource.created_at
+          
+          // For append mode, concatenate summaries
+          if (update_mode === 'append' && existingSource.summary) {
+            summaryDoc.summary = `${existingSource.summary}\n\n${summary}`
+            summaryDoc.semantic_summary = summaryDoc.summary
+          }
+          
+          // Update the document
+          await esClient.index({
+            index: summariesIndex,
+            id: conversationId,
+            body: summaryDoc,
+            refresh: true
+          })
+          
+          const response = formatSuccessResponse(
+            { 
+              conversation_id: conversationId, 
+              updated: true,
+              appended: update_mode === 'append'
+            },
+            'store_conversation_summary'
+          )
+          
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(response, null, 2)
+            }]
+          }
+        }
+      } catch (error) {
+        console.error(`Failed to store conversation summary: ${error instanceof Error ? error.message : String(error)}`)
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatErrorResponse(
+              error,
+              'SUMMARY_STORE_ERROR'
+            ), null, 2)
+          }]
+        }
+      }
+    }
+  )
+
+  // Tool: Update Conversation Summary
+  server.tool(
+    'update_conversation_summary',
+    'Update specific fields of an existing conversation summary',
+    {
+      conversation_id: z
+        .string()
+        .trim()
+        .min(1, 'Conversation ID is required')
+        .describe('UUID for the conversation to update'),
+        
+      updates: z
+        .object({
+          title: z.string().optional(),
+          outcome: z.string().optional(),
+          metadata: z.record(z.any()).optional()
+        })
+        .optional()
+        .describe('Fields to update (title, outcome, metadata)'),
+        
+      append_to_summary: z
+        .string()
+        .optional()
+        .describe('Text to append to existing summary'),
+        
+      add_topics: z
+        .array(z.string())
+        .optional()
+        .describe('New topics to add to existing'),
+        
+      increment_message_count: z
+        .number()
+        .int()
+        .optional()
+        .describe('Add to current message count')
+    },
+    async ({ conversation_id, updates, append_to_summary, add_topics, increment_message_count }) => {
+      try {
+        const summariesIndex = `${indexPrefix}conversation-summaries`
+        
+        // Check if conversation exists
+        const exists = await conversationExists(conversation_id)
+        
+        if (!exists) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(formatErrorResponse(
+                `Conversation with ID ${conversation_id} not found.`, 
+                'CONVERSATION_NOT_FOUND'
+              ), null, 2)
+            }]
+          }
+        }
+        
+        // Get current document to build update
+        const currentDoc = await esClient.get({
+          index: summariesIndex,
+          id: conversation_id
+        })
+        
+        const currentSource = currentDoc._source as any
+        const now = new Date().toISOString()
+        
+        // Build the updated document
+        const updatedDoc: any = {
+          ...currentSource,
+          updated_at: now
+        }
+        
+        // Apply direct field updates
+        if (updates) {
+          if (updates.title) {
+            updatedDoc.title = updates.title
+          }
+          
+          if (updates.outcome) {
+            updatedDoc.outcome = updates.outcome
+          }
+          
+          if (updates.metadata) {
+            updatedDoc.metadata = updates.metadata
+          }
+        }
+        
+        // Handle summary appending
+        if (append_to_summary) {
+          if (!currentSource.summary) {
+            updatedDoc.summary = append_to_summary
+          } else {
+            updatedDoc.summary = `${currentSource.summary}\n\n${append_to_summary}`
+          }
+          // Update semantic summary field as well
+          updatedDoc.semantic_summary = updatedDoc.summary
+        }
+        
+        // Handle topic addition (merge without duplicates)
+        if (add_topics && add_topics.length > 0) {
+          const existingTopics = currentSource.key_topics || []
+          const newTopics = [...new Set([...existingTopics, ...add_topics])]
+          updatedDoc.key_topics = newTopics
+        }
+        
+        // Handle message count increment
+        if (increment_message_count !== undefined) {
+          const currentCount = currentSource.message_count || 0
+          updatedDoc.message_count = currentCount + increment_message_count
+        }
+        
+        // Execute the update using index (overwrites document)
+        await esClient.index({
+          index: summariesIndex,
+          id: conversation_id,
+          body: updatedDoc,
+          refresh: true
+        })
+        
+        // Get the updated document for response
+        const refreshedDoc = await esClient.get({
+          index: summariesIndex,
+          id: conversation_id
+        })
+        
+        const updatedSource = refreshedDoc._source as any
+        
+        const response_data = {
+          conversation_id,
+          updated_fields: {
+            title: updates?.title !== undefined,
+            outcome: updates?.outcome !== undefined,
+            metadata: updates?.metadata !== undefined,
+            summary: append_to_summary !== undefined,
+            key_topics: add_topics !== undefined && add_topics.length > 0,
+            message_count: increment_message_count !== undefined
+          },
+          current_state: {
+            title: updatedSource.title,
+            summary_length: updatedSource.summary ? updatedSource.summary.length : 0,
+            key_topics: updatedSource.key_topics || [],
+            message_count: updatedSource.message_count || 0,
+            updated_at: updatedSource.updated_at
+          }
+        }
+        
+        const formatted_response = formatSuccessResponse(
+          response_data,
+          'update_conversation_summary'
+        )
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatted_response, null, 2)
+          }]
+        }
+      } catch (error) {
+        console.error(`Failed to update conversation summary: ${error instanceof Error ? error.message : String(error)}`)
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatErrorResponse(
+              error,
+              'UPDATE_SUMMARY_ERROR'
+            ), null, 2)
+          }]
+        }
+      }
+    }
+  )
+
+  // Tool: Delete Conversation Data
+  server.tool(
+    'delete_conversation_data',
+    'Delete conversation summary and/or messages with confirmation',
+    {
+      conversation_id: z
+        .string()
+        .trim()
+        .min(1, 'Conversation ID is required')
+        .describe('UUID for the conversation to delete'),
+        
+      delete_scope: z
+        .enum(['summary_only', 'messages_only', 'all'])
+        .describe('What components of the conversation to delete'),
+        
+      confirm_delete: z
+        .boolean()
+        .describe('Safety check that must be true to proceed with deletion'),
+        
+      backup_before_delete: z
+        .boolean()
+        .default(false)
+        .describe('Whether to return the data before deletion')
+    },
+    async ({ conversation_id, delete_scope, confirm_delete, backup_before_delete }) => {
+      try {
+        const summariesIndex = `${indexPrefix}conversation-summaries`
+        const messagesIndex = `${indexPrefix}conversation-messages`
+        
+        // Safety check - require explicit confirmation
+        if (!confirm_delete) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(formatErrorResponse(
+                'Safety check: confirm_delete must be set to true to proceed with deletion', 
+                'CONFIRMATION_REQUIRED'
+              ), null, 2)
+            }]
+          }
+        }
+        
+        // Check if conversation exists
+        const exists = await conversationExists(conversation_id)
+        
+        if (!exists) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(formatErrorResponse(
+                `Conversation with ID ${conversation_id} not found.`, 
+                'CONVERSATION_NOT_FOUND'
+              ), null, 2)
+            }]
+          }
+        }
+        
+        // Backup data if requested
+        let backupData = null
+        
+        if (backup_before_delete) {
+          const backupPromises = []
+          
+          // Backup summary if needed
+          if (delete_scope === 'summary_only' || delete_scope === 'all') {
+            backupPromises.push(
+              esClient.get({
+                index: summariesIndex,
+                id: conversation_id
+              }).catch(() => null)
+            )
+          } else {
+            backupPromises.push(Promise.resolve(null))
+          }
+          
+          // Backup messages if needed
+          if (delete_scope === 'messages_only' || delete_scope === 'all') {
+            backupPromises.push(
+              esClient.search({
+                index: messagesIndex,
+                query: {
+                  term: { conversation_id }
+                },
+                size: 10000, // Get all messages, practical limit
+                sort: [
+                  { sequence_number: { order: 'asc' } }
+                ]
+              }).catch(() => null)
+            )
+          } else {
+            backupPromises.push(Promise.resolve(null))
+          }
+          
+          // Get backup data
+          const [summaryBackup, messagesBackup] = await Promise.all(backupPromises)
+          
+          backupData = {
+            summary: summaryBackup && 'found' in summaryBackup && summaryBackup.found ? 
+              summaryBackup._source : null,
+            messages: messagesBackup && 'hits' in messagesBackup ? 
+              messagesBackup.hits.hits.map((hit: any) => hit._source) : []
+          }
+        }
+        
+        // Delete data based on scope
+        const deletePromises = []
+        
+        if (delete_scope === 'summary_only' || delete_scope === 'all') {
+          deletePromises.push(
+            esClient.delete({
+              index: summariesIndex,
+              id: conversation_id,
+              refresh: true
+            }).catch(error => {
+              console.error(`Error deleting summary: ${error instanceof Error ? error.message : String(error)}`)
+              return null
+            })
+          )
+        }
+        
+        if (delete_scope === 'messages_only' || delete_scope === 'all') {
+          deletePromises.push(
+            esClient.deleteByQuery({
+              index: messagesIndex,
+              query: {
+                term: { conversation_id }
+              },
+              refresh: true
+            }).catch(error => {
+              console.error(`Error deleting messages: ${error instanceof Error ? error.message : String(error)}`)
+              return null
+            })
+          )
+        }
+        
+        // Execute deletions
+        await Promise.all(deletePromises)
+        
+        const response_data: any = {
+          conversation_id,
+          delete_scope,
+          deleted: {
+            summary: delete_scope === 'summary_only' || delete_scope === 'all',
+            messages: delete_scope === 'messages_only' || delete_scope === 'all'
+          }
+        }
+        
+        // Include backup data if requested
+        if (backup_before_delete && backupData) {
+          response_data.backup_data = backupData
+        }
+        
+        const formatted_response = formatSuccessResponse(
+          response_data,
+          'delete_conversation_data'
+        )
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatted_response, null, 2)
+          }]
+        }
+      } catch (error) {
+        console.error(`Failed to delete conversation data: ${error instanceof Error ? error.message : String(error)}`)
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatErrorResponse(
+              error,
+              'DELETE_CONVERSATION_ERROR'
+            ), null, 2)
+          }]
+        }
+      }
+    }
+  )
+
+  // Tool: Get Conversation Statistics
+  server.tool(
+    'get_conversation_statistics',
+    'Get analytics about stored conversations',
+    {
+      user_id: z
+        .string()
+        .optional()
+        .describe('Scope to specific user'),
+        
+      date_range: z
+        .object({
+          from: z.string().optional().describe('Start date (ISO format)'),
+          to: z.string().optional().describe('End date (ISO format)')
+        })
+        .optional()
+        .describe('Time window for analysis'),
+        
+      group_by: z
+        .enum(['topic', 'outcome', 'date', 'user'])
+        .default('date')
+        .describe('Primary grouping dimension for statistics'),
+        
+      include_trending_topics: z
+        .boolean()
+        .default(false)
+        .describe('Whether to include trending topic analysis'),
+        
+      include_message_counts: z
+        .boolean()
+        .default(true)
+        .describe('Whether to include message count statistics')
+    },
+    async ({ user_id, date_range, group_by, include_trending_topics, include_message_counts }) => {
+      try {
+        const summariesIndex = `${indexPrefix}conversation-summaries`
+        const messagesIndex = `${indexPrefix}conversation-messages`
+        
+        // Ensure indices exist
+        await ensureConversationIndicesExist()
+        
+        // Build base query
+        const query: any = { bool: { must: [] } }
+        
+        // Add user filter if specified
+        if (user_id) {
+          query.bool.must.push({ term: { user_id } })
+        }
+        
+        // Add date range filter if specified
+        if (date_range) {
+          const rangeFilter: any = { updated_at: {} }
+          
+          if (date_range.from) {
+            rangeFilter.updated_at.gte = date_range.from
+          }
+          
+          if (date_range.to) {
+            rangeFilter.updated_at.lte = date_range.to
+          }
+          
+          query.bool.must.push({ range: rangeFilter })
+        }
+        
+        // Start building response data
+        const response_data: any = {
+          total_conversations: 0,
+          time_period: date_range || "all time",
+          user_filter: user_id || "all users"
+        }
+        
+        // Get total conversation count
+        const countResponse = await esClient.count({
+          index: summariesIndex,
+          query
+        })
+        
+        response_data.total_conversations = countResponse.count
+        
+        // Build aggregations based on group_by parameter
+        const aggs: any = {}
+        
+        if (group_by === 'topic') {
+          aggs.by_topic = {
+            terms: {
+              field: "key_topics",
+              size: 20
+            }
+          }
+        } else if (group_by === 'outcome') {
+          aggs.by_outcome = {
+            terms: {
+              field: "outcome",
+              size: 20
+            }
+          }
+        } else if (group_by === 'user') {
+          aggs.by_user = {
+            terms: {
+              field: "user_id",
+              size: 100
+            }
+          }
+        } else if (group_by === 'date') {
+          // Use date histogram for time-based grouping
+          aggs.by_date = {
+            date_histogram: {
+              field: "created_at",
+              calendar_interval: "day",
+              format: "yyyy-MM-dd"
+            }
+          }
+        }
+        
+        // Add message count stats if requested
+        if (include_message_counts) {
+          // Add nested stats aggregation to get message count stats
+          const messageStatsAgg = {
+            stats: {
+              field: "message_count"
+            }
+          }
+          
+          // Add to appropriate aggregation based on group_by
+          if (group_by === 'topic') {
+            aggs.by_topic.aggs = { message_stats: messageStatsAgg }
+            aggs.overall_message_stats = messageStatsAgg
+          } else if (group_by === 'outcome') {
+            aggs.by_outcome.aggs = { message_stats: messageStatsAgg }
+            aggs.overall_message_stats = messageStatsAgg
+          } else if (group_by === 'user') {
+            aggs.by_user.aggs = { message_stats: messageStatsAgg }
+            aggs.overall_message_stats = messageStatsAgg
+          } else if (group_by === 'date') {
+            aggs.by_date.aggs = { message_stats: messageStatsAgg }
+            aggs.overall_message_stats = messageStatsAgg
+          }
+        }
+        
+        // Add trending topics aggregation if requested
+        if (include_trending_topics) {
+          aggs.trending_topics = {
+            terms: {
+              field: "key_topics",
+              size: 20,
+              order: { _count: "desc" }
+            }
+          }
+          
+          // Add sub-aggregation to get time trend
+          if (date_range) {
+            aggs.topics_over_time = {
+              date_histogram: {
+                field: "created_at",
+                calendar_interval: "day",
+                format: "yyyy-MM-dd"
+              },
+              aggs: {
+                top_topics: {
+                  terms: {
+                    field: "key_topics",
+                    size: 5
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        // Execute aggregation query
+        const aggResponse = await esClient.search({
+          index: summariesIndex,
+          query,
+          size: 0, // We only want aggregations, not hits
+          aggs
+        })
+        
+        // Process aggregation results
+        if (aggResponse.aggregations) {
+          const aggs = aggResponse.aggregations as any
+          
+          // Group by statistics
+          if (group_by === 'topic' && aggs.by_topic) {
+            response_data.by_topic = aggs.by_topic.buckets.map((bucket: any) => ({
+              topic: bucket.key,
+              conversation_count: bucket.doc_count,
+              message_stats: bucket.message_stats
+            }))
+          } else if (group_by === 'outcome' && aggs.by_outcome) {
+            response_data.by_outcome = aggs.by_outcome.buckets.map((bucket: any) => ({
+              outcome: bucket.key,
+              conversation_count: bucket.doc_count,
+              message_stats: bucket.message_stats
+            }))
+          } else if (group_by === 'user' && aggs.by_user) {
+            response_data.by_user = aggs.by_user.buckets.map((bucket: any) => ({
+              user_id: bucket.key,
+              conversation_count: bucket.doc_count,
+              message_stats: bucket.message_stats
+            }))
+          } else if (group_by === 'date' && aggs.by_date) {
+            response_data.by_date = aggs.by_date.buckets.map((bucket: any) => ({
+              date: bucket.key_as_string,
+              conversation_count: bucket.doc_count,
+              message_stats: bucket.message_stats
+            }))
+          }
+          
+          // Message count statistics
+          if (include_message_counts && aggs.overall_message_stats) {
+            response_data.message_statistics = {
+              total: aggs.overall_message_stats.sum,
+              average_per_conversation: aggs.overall_message_stats.avg,
+              min: aggs.overall_message_stats.min,
+              max: aggs.overall_message_stats.max
+            }
+          }
+          
+          // Trending topics
+          if (include_trending_topics && aggs.trending_topics) {
+            response_data.trending_topics = aggs.trending_topics.buckets.map((bucket: any) => ({
+              topic: bucket.key,
+              count: bucket.doc_count
+            }))
+            
+            // Topics over time
+            if (aggs.topics_over_time) {
+              response_data.topics_over_time = aggs.topics_over_time.buckets.map((dateBucket: any) => {
+                const topTopics = dateBucket.top_topics.buckets.map((topicBucket: any) => ({
+                  topic: topicBucket.key,
+                  count: topicBucket.doc_count
+                }))
+                
+                return {
+                  date: dateBucket.key_as_string,
+                  topics: topTopics
+                }
+              })
+            }
+          }
+        }
+        
+        const formatted_response = formatSuccessResponse(
+          response_data,
+          'get_conversation_statistics'
+        )
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatted_response, null, 2)
+          }]
+        }
+      } catch (error) {
+        console.error(`Failed to get conversation statistics: ${error instanceof Error ? error.message : String(error)}`)
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(formatErrorResponse(
+              error,
+              'GET_STATISTICS_ERROR'
+            ), null, 2)
+          }]
+        }
+      }
+    }
+  )
+
+  // Tool: Generic Elasticsearch API (TESTING/DEVELOPMENT ONLY)
+  server.tool(
+    'elasticsearch_api_call',
+    '⚠️  TESTING/DEVELOPMENT ONLY: Direct Elasticsearch API access. DO NOT USE IN PRODUCTION. Use specific tools instead.',
+    {
+      method: z
+        .enum(['GET', 'POST', 'PUT', 'DELETE', 'HEAD'])
+        .describe('HTTP method for the API call'),
+        
+      path: z
+        .string()
+        .trim()
+        .min(1, 'API path is required')
+        .describe('Elasticsearch API path (e.g., "/_cluster/health", "/my-index/_search")'),
+        
+      body: z
+        .record(z.any())
+        .optional()
+        .describe('Request body for POST/PUT requests (JSON object)'),
+        
+      query_params: z
+        .record(z.string())
+        .optional()
+        .describe('Query parameters as key-value pairs'),
+        
+      acknowledge_testing_only: z
+        .boolean()
+        .describe('Must be true - acknowledges this is for testing/development only')
+    },
+    async ({ method, path, body, query_params, acknowledge_testing_only }) => {
+      try {
+        // Safety check - require explicit acknowledgment
+        if (!acknowledge_testing_only) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                error: 'ACKNOWLEDGMENT_REQUIRED',
+                message: 'This tool is for TESTING/DEVELOPMENT ONLY. Set acknowledge_testing_only=true to proceed.',
+                warning: 'DO NOT USE IN PRODUCTION. Use specific MCP tools instead.',
+                production_alternatives: [
+                  'Use search tool for querying data',
+                  'Use create_index tool for index management', 
+                  'Use index_document tool for adding documents',
+                  'Use list_indices tool for cluster information'
+                ]
+              }, null, 2)
+            }]
+          }
+        }
+        
+        // Build the request
+        const requestOptions: any = {
+          method: method.toUpperCase(),
+          path: path.startsWith('/') ? path : `/${path}`
+        }
+        
+        // Add query parameters if provided
+        if (query_params && Object.keys(query_params).length > 0) {
+          const queryString = new URLSearchParams(query_params).toString()
+          requestOptions.path += `?${queryString}`
+        }
+        
+        // Add body for POST/PUT requests
+        if (body && (method === 'POST' || method === 'PUT')) {
+          requestOptions.body = body
+        }
+        
+        // Execute the API call
+        const response = await esClient.transport.request(requestOptions)
+        
+        // Format response with safety warnings
+        const result = {
+          warning: 'TESTING/DEVELOPMENT TOOL - NOT FOR PRODUCTION USE',
+          request: {
+            method,
+            path: requestOptions.path,
+            body: body || null
+          },
+          response: {
+            status: (response as any).statusCode || 200,
+            data: (response as any).body || response
+          },
+          safety_warnings: [
+            'This tool bypasses MCP safety features',
+            'Use specific MCP tools in production environments',
+            'Direct API access can cause data loss or corruption',
+            'This tool may be removed in production versions'
+          ]
+        }
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(result, null, 2)
+          }]
+        }
+        
+      } catch (error) {
+        console.error(`Generic API call failed: ${error instanceof Error ? error.message : String(error)}`)
+        
+        // Enhanced error response with guidance
+        const errorResponse = {
+          warning: 'TESTING/DEVELOPMENT TOOL - ERROR OCCURRED',
+          error: {
+            message: error instanceof Error ? error.message : String(error),
+            type: 'ELASTICSEARCH_API_ERROR'
+          },
+          request: {
+            method,
+            path,
+            body: body || null
+          },
+          suggestions: [
+            'Check if the API path is correct',
+            'Verify your authentication has required permissions',
+            'Consider using specific MCP tools instead:',
+            '  - search tool for queries',
+            '  - list_indices for cluster info',
+            '  - create_index for index management'
+          ]
+        }
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(errorResponse, null, 2)
+          }]
+        }
+      }
+    }
+  )
+
+  // Helper to ensure conversation indices exist with correct mappings
+  async function ensureConversationIndicesExist(): Promise<void> {
+    const summariesConfig = indexConfigurations['conversation-summaries']
+    const messagesConfig = indexConfigurations['conversation-messages']
+    
+    const summariesIndex = `${indexPrefix}${summariesConfig.name}`
+    const messagesIndex = `${indexPrefix}${messagesConfig.name}`
+    
+    // Check if indices exist
+    const [summariesExist, messagesExist] = await Promise.all([
+      esClient.indices.exists({ index: summariesIndex }),
+      esClient.indices.exists({ index: messagesIndex })
+    ])
+    
+    const createPromises = []
+    
+    // Create summaries index if needed
+    if (!summariesExist) {
+      createPromises.push(
+        esClient.indices.create({
+          index: summariesIndex,
+          settings: summariesConfig.settings,
+          mappings: summariesConfig.mappings
+        }).catch(error => {
+          console.error(`Failed to create summaries index: ${error instanceof Error ? error.message : String(error)}`)
+          throw error
+        })
+      )
+    }
+    
+    // Create messages index if needed
+    if (!messagesExist) {
+      createPromises.push(
+        esClient.indices.create({
+          index: messagesIndex,
+          settings: messagesConfig.settings,
+          mappings: messagesConfig.mappings
+        }).catch(error => {
+          console.error(`Failed to create messages index: ${error instanceof Error ? error.message : String(error)}`)
+          throw error
+        })
+      )
+    }
+    
+    // Wait for indices to be created
+    if (createPromises.length > 0) {
+      await Promise.all(createPromises)
+    }
+  }
+
+  // Helper to get highest sequence number for a conversation
+  async function getHighestSequenceNumber(conversationId: string): Promise<number> {
+    const messagesIndex = `${indexPrefix}conversation-messages`
+    
+    try {
+      const response = await esClient.search({
+        index: messagesIndex,
+        query: {
+          term: { conversation_id: conversationId }
+        },
+        size: 1,
+        sort: [
+          { sequence_number: { order: 'desc' } }
+        ]
+      })
+      
+      if (response.hits.hits.length > 0) {
+        const source = response.hits.hits[0]._source as any
+        return source.sequence_number
+      }
+      
+      return 0 // No messages yet
+    } catch (error) {
+      console.error(`Failed to get highest sequence number: ${error instanceof Error ? error.message : String(error)}`)
+      return 0
+    }
+  }
+
+  // Helper to check if conversation exists
+  async function conversationExists(conversationId: string): Promise<boolean> {
+    const summariesIndex = `${indexPrefix}conversation-summaries`
+    
+    try {
+      const response = await esClient.search({
+        index: summariesIndex,
+        query: {
+          term: { conversation_id: conversationId }
+        },
+        size: 1
+      })
+      
+      return (response.hits.total as any).value > 0
+    } catch (error) {
+      console.error(`Failed to check conversation existence: ${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+  }
+
+  // Helper to format success response
+  function formatSuccessResponse(data: any, operation: string): any {
+    return {
+      success: true,
+      data,
+      metadata: {
+        operation,
+        timestamp: new Date().toISOString(),
+        execution_time_ms: 0 // This would be implementation-dependent
+      }
+    }
+  }
+
+  // Helper to format error response
+  function formatErrorResponse(error: any, code: string): any {
+    return {
+      success: false,
+      error: {
+        code,
+        message: error instanceof Error ? error.message : String(error),
+        details: error instanceof Error ? error.stack : undefined
+      }
+    }
+  }
+  
   return server
 }
 
@@ -1426,7 +2731,10 @@ const config: ElasticsearchConfig = {
   version: process.env.ES_VERSION ?? '',
   sslSkipVerify: process.env.ES_SSL_SKIP_VERIFY === '1' || process.env.ES_SSL_SKIP_VERIFY === 'true',
   pathPrefix: process.env.ES_PATH_PREFIX ?? '',
-  indexPrefix: process.env.ES_INDEX_PREFIX ?? 'mcp-'
+  indexPrefix: process.env.ES_INDEX_PREFIX ?? 'mcp-',
+  enableSemanticText: process.env.ES_ENABLE_SEMANTIC_TEXT !== 'false',
+  inferenceEndpoint: process.env.ES_INFERENCE_ENDPOINT ?? DEFAULT_SEMANTIC_CONFIG.inferenceEndpoint,
+  semanticFallback: process.env.ES_SEMANTIC_FALLBACK !== 'false'
 }
 
 async function main (): Promise<void> {
